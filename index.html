@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>元素連鎖計算機（高速多執行緒版）</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    .panel {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .brush {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      border: 2px solid transparent;
+      cursor: pointer;
+      font-weight: bold;
+      color: #fff;
+    }
+    .brush.active { border-color: #fff; transform: scale(1.1); }
+    .c1 { background: #ef4444; } /* 火 */
+    .c2 { background: #3b82f6; } /* 水 */
+    .c3 { background: #22c55e; } /* 木 */
+    .c4 { background: #eab308; color: #000; } /* 光 */
+    .c5 { background: #a855f7; } /* 暗 */
+
+    .board {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      max-width: 340px;
+      margin: 0 auto;
+    }
+    .cell {
+      aspect-ratio: 1;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      cursor: pointer;
+      user-select: none;
+      position: relative;
+      transition: transform 0.1s;
+    }
+    .cell:active { transform: scale(0.95); }
+    .cell .coord { font-size: 0.7rem; opacity: 0.75; }
+    .cell .rank-badge {
+      position: absolute;
+      top: -6px;
+      right: -6px;
+      background: #fff;
+      color: #0f172a;
+      font-size: 0.75rem;
+      padding: 2px 6px;
+      border-radius: 999px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+    }
+
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+      margin-top: 16px;
+      flex-wrap: wrap;
+    }
+    select, button.primary, button.secondary {
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    select { background: #334155; color: #fff; }
+    button.primary { background: var(--accent); color: #0f172a; }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #334155; color: #fff; }
+
+    .status {
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 10px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 8px;
+      text-align: left;
+      border-bottom: 1px solid #334155;
+    }
+    th { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <h1>⚡ 元素連鎖計算機（多執行緒加速版）</h1>
+
+  <div class="panel">
+    <div class="toolbar">
+      <span>選擇屬性筆刷：</span>
+      <button class="brush c1 active" data-color="1">火</button>
+      <button class="brush c2" data-color="2">水</button>
+      <button class="brush c3" data-color="3">木</button>
+      <button class="brush c4" data-color="4">光</button>
+      <button class="brush c5" data-color="5">暗</button>
+      <button class="secondary" id="randomBtn" style="margin-left:auto;">隨機盤面</button>
+    </div>
+
+    <div class="board" id="board"></div>
+
+    <div class="controls">
+      <label>
+        規劃步數上限：
+        <select id="maxSteps">
+          <option value="2">2 步（極速）</option>
+          <option value="3" selected>3 步（推薦）</option>
+          <option value="4">4 步（深度佈局，需數分鐘）</option>
+        </select>
+      </label>
+      <button class="primary" id="calcBtn">開始計算</button>
+    </div>
+    <div class="status" id="status">準備就緒（偵測到 <span id="coreCount"></span> 個邏輯核心）</div>
+  </div>
+
+  <div class="panel">
+    <strong>推薦起手點排名（依「期望消除張數 / 步數」排序）</strong>
+    <table>
+      <thead>
+        <tr>
+          <th>排名</th>
+          <th>位置 (列, 行)</th>
+          <th>平均每步消除</th>
+          <th>最佳規劃步數</th>
+          <th>總期望消除</th>
+        </tr>
+      </thead>
+      <tbody id="resultBody">
+        <tr><td colspan="5" style="color:var(--muted);text-align:center;">點擊「開始計算」顯示結果</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    const COLOR_NAMES = ['', '火', '水', '木', '光', '暗'];
+    const NUM_COLORS = 5;
+    let currentBrush = 1;
+    let board = new Array(25).fill(1);
+    let topRanks = new Map();
+
+    // 初始化 Web Worker Pool
+    const workerCount = Math.min(navigator.hardwareConcurrency || 4, 12);
+    document.getElementById('coreCount').textContent = workerCount;
+    const workers = Array.from({ length: workerCount }, () =>
+      new Worker('./worker.js', { type: 'module' })
+    );
+
+    const boardEl = document.getElementById('board');
+    const statusEl = document.getElementById('status');
+    const resultBody = document.getElementById('resultBody');
+    const calcBtn = document.getElementById('calcBtn');
+
+    // 筆刷切換
+    document.querySelectorAll('.brush').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.brush').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentBrush = Number(btn.dataset.color);
+      });
+    });
+
+    function randomizeBoard() {
+      board = Array.from({ length: 25 }, () => Math.floor(Math.random() * NUM_COLORS) + 1);
+      topRanks.clear();
+      renderBoard();
+    }
+
+    function renderBoard() {
+      boardEl.innerHTML = '';
+      for (let i = 0; i < 25; i++) {
+        const cell = document.createElement('div');
+        cell.className = `cell c${board[i]}`;
+        const r = Math.floor(i / 5) + 1;
+        const c = (i % 5) + 1;
+        cell.innerHTML = `
+          <span>${COLOR_NAMES[board[i]]}</span>
+          <span class="coord">${r},${c}</span>
+          ${topRanks.has(i) ? `<span class="rank-badge">#${topRanks.get(i)}</span>` : ''}
+        `;
+        cell.addEventListener('click', () => {
+          board[i] = currentBrush;
+          topRanks.clear();
+          renderBoard();
+        });
+        boardEl.appendChild(cell);
+      }
+    }
+
+    document.getElementById('randomBtn').addEventListener('click', randomizeBoard);
+
+    // 平行計算調度
+    calcBtn.addEventListener('click', async () => {
+      const maxSteps = Number(document.getElementById('maxSteps').value);
+      calcBtn.disabled = true;
+      statusEl.textContent = `正在使用 ${workerCount} 執行緒平行運算 ${maxSteps} 步規劃...`;
+
+      const t0 = performance.now();
+
+      // 將 25 個起手點平均分配給各個 Worker
+      const chunks = Array.from({ length: workerCount }, () => []);
+      for (let i = 0; i < 25; i++) {
+        chunks[i % workerCount].push(i);
+      }
+
+      const promises = chunks.map((indices, wIdx) => {
+        if (indices.length === 0) return Promise.resolve([]);
+        return new Promise(resolve => {
+          const worker = workers[wIdx];
+          const handler = (e) => {
+            worker.removeEventListener('message', handler);
+            resolve(e.data.results);
+          };
+          worker.addEventListener('message', handler);
+          worker.postMessage({
+            board,
+            numColors: NUM_COLORS,
+            startIndices: indices,
+            maxSteps
+          });
+        });
+      });
+
+      const nestedResults = await Promise.all(promises);
+      const allResults = nestedResults.flat().sort((a, b) => b.scorePerStep - a.scorePerStep);
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+
+      // 更新前三名徽章
+      topRanks.clear();
+      allResults.slice(0, 3).forEach((item, idx) => topRanks.set(item.index, idx + 1));
+      renderBoard();
+
+      // 渲染排行榜表格
+      resultBody.innerHTML = allResults.slice(0, 10).map((item, idx) => `
+        <tr>
+          <td><strong>#${idx + 1}</strong></td>
+          <td>第 ${item.row} 列, 第 ${item.col} 行 (${COLOR_NAMES[board[item.index]]})</td>
+          <td><strong>${item.scorePerStep.toFixed(2)}</strong> 張/步</td>
+          <td>${item.bestStep} 步</td>
+          <td>${item.expectedTotal.toFixed(2)} 張</td>
+        </tr>
+      `).join('');
+
+      statusEl.textContent = `計算完成！耗時 ${elapsed} 秒（${workerCount} 核心平行運算）`;
+      calcBtn.disabled = false;
+    });
+
+    randomizeBoard();
+  </script>
+</body>
+</html>
