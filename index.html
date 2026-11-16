@@ -146,8 +146,8 @@
         規劃步數上限：
         <select id="maxSteps">
           <option value="2">2 步（極速）</option>
-          <option value="3" selected>3 步（推薦）</option>
-          <option value="4">4 步（深度佈局，需數分鐘）</option>
+          <option value="3">3 步（推薦）</option>
+          <option value="4" selected>4 步（深度佈局）</option>
         </select>
       </label>
       <button class="primary" id="calcBtn">開始計算</button>
@@ -238,32 +238,26 @@
 
       const t0 = performance.now();
 
-      // 將 25 個起手點平均分配給各個 Worker
-      const chunks = Array.from({ length: workerCount }, () => []);
-      for (let i = 0; i < 25; i++) {
-        chunks[i % workerCount].push(i);
-      }
-
-      const promises = chunks.map((indices, wIdx) => {
-        if (indices.length === 0) return Promise.resolve([]);
-        return new Promise(resolve => {
-          const worker = workers[wIdx];
-          const handler = (e) => {
-            worker.removeEventListener('message', handler);
-            resolve(e.data.results);
+      // 動態工作佇列：每個 Worker 一次領一個起手點，算完再領下一個（避免有的核心閒置、有的塞車）
+      const queue = Array.from({ length: 25 }, (_, i) => i);
+      const allResultsRaw = [];
+      let done = 0;
+      await Promise.all(workers.map(worker => new Promise(resolve => {
+        const next = () => {
+          if (queue.length === 0) { worker.onmessage = null; resolve(); return; }
+          const idx = queue.shift();
+          worker.onmessage = (e) => {
+            allResultsRaw.push(...e.data.results);
+            done++;
+            statusEl.textContent = `正在使用 ${workerCount} 執行緒運算 ${maxSteps} 步規劃⋯⋯ ${done}/25`;
+            next();
           };
-          worker.addEventListener('message', handler);
-          worker.postMessage({
-            board,
-            numColors: NUM_COLORS,
-            startIndices: indices,
-            maxSteps
-          });
-        });
-      });
+          worker.postMessage({ board, numColors: NUM_COLORS, startIndices: [idx], maxSteps });
+        };
+        next();
+      })));
 
-      const nestedResults = await Promise.all(promises);
-      const allResults = nestedResults.flat().sort((a, b) => b.scorePerStep - a.scorePerStep);
+      const allResults = allResultsRaw.sort((a, b) => b.scorePerStep - a.scorePerStep);
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
       // 更新前三名徽章

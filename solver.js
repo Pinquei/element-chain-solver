@@ -1,280 +1,282 @@
 /**
- * 高效能 5x5 元素連鎖求解器
- * 優化技術：
- * 1. 一維 Uint8Array(25) 零配置記憶體複用
- * 2. 預計算 30 組橫/直向三連線查表
- * 3. Transposition Table (置換表) 狀態去重
- * 4. 深層節點啟發式 Top-K 動作剪枝 (Beam Pruning)
+ * 高效能 5x5 元素連鎖求解器（v2）
+ *
+ * 相較 v1 的主要優化：
+ * 1. 確定性分支只算一次：點擊後若補入的那張牌沒有引發連鎖，結果完全由補牌顏色決定，
+ *    不再重複蒙地卡羅取樣（v1 對同一結果重算 4～16 次）。只有發生連鎖（之後補牌隨機）才取樣。
+ * 2. 多步數共用同一棵搜尋樹：一次遞迴同時算出 1～N 步的期望值向量，
+ *    不再為 1、2、3、4 步各重跑一次搜尋。
+ * 3. 零配置模擬：每層遞迴使用預先配置的緩衝區，單格點擊直接位移欄位（免完整重力計算），
+ *    使用 xorshift 亂數取代 Math.random。
+ * 4. 置換表（Transposition Table）以數值雙鍵編碼盤面，每次計算前清空，避免記憶體越用越多。
+ * 5. 深層 Top-K 剪枝保留，葉節點（最後一步）完整評估 25 個點擊點。
  */
 
 const SIZE = 5;
 const CELLS = 25;
 
-// 預計算所有 30 組「連續 3 格」的索引組合（橫向 15 組 + 直向 15 組）
-const LINES_3 = [];
-for (let r = 0; r < SIZE; r++) {
-  for (let c = 0; c <= SIZE - 3; c++) {
-    LINES_3.push([r * 5 + c, r * 5 + c + 1, r * 5 + c + 2]);
+// 預計算 30 組三連線（橫 15 + 直 15），攤平成三個型別陣列加速存取
+const LA = new Uint8Array(30), LB = new Uint8Array(30), LC = new Uint8Array(30);
+{
+  let n = 0;
+  for (let r = 0; r < SIZE; r++) for (let c = 0; c <= SIZE - 3; c++) {
+    LA[n] = r * 5 + c; LB[n] = r * 5 + c + 1; LC[n] = r * 5 + c + 2; n++;
+  }
+  for (let c = 0; c < SIZE; c++) for (let r = 0; r <= SIZE - 3; r++) {
+    LA[n] = r * 5 + c; LB[n] = (r + 1) * 5 + c; LC[n] = (r + 2) * 5 + c; n++;
   }
 }
-for (let c = 0; c < SIZE; c++) {
-  for (let r = 0; r <= SIZE - 3; r++) {
-    LINES_3.push([r * 5 + c, (r + 1) * 5 + c, (r + 2) * 5 + c]);
+const NLINES = 30;
+
+// 每個點擊位置會「動到」的格子 = 同欄、該列以上（含）；只有經過這些格子的線可能新形成三消
+const AFFECTED = [];
+for (let idx = 0; idx < CELLS; idx++) {
+  const c = idx % 5, r = (idx / 5) | 0;
+  const list = [];
+  for (let i = 0; i < 30; i++) {
+    for (const cell of [LA[i], LB[i], LC[i]]) {
+      if (cell % 5 === c && ((cell / 5) | 0) <= r) { list.push(i); break; }
+    }
   }
+  AFFECTED.push(Uint8Array.from(list));
 }
+const ALL_MOVES = Array.from({ length: CELLS }, (_, i) => i);
+
+// 搜尋參數（依「剩餘步數」決定）
+const TOPK_BY_REMAINING = [0, 25, 10, 8, 6, 5];       // 剩 1 步（葉節點）全評估
+const CHAIN_SAMPLES_BY_REMAINING = [0, 1, 1, 1, 1, 1]; // 發生連鎖時的取樣數
+const ROOT_CHAIN_SAMPLES = 6;
+const MAX_STEPS = 5;
 
 export class ChainSolver {
   constructor(numColors = 5) {
     this.numColors = numColors;
     this.memo = new Map();
-    // 預先配置緩衝區，避免遞迴中反覆 new Array 觸發 GC
     this.clearFlags = new Uint8Array(CELLS);
+    this.isNew = new Uint8Array(CELLS);
+    this.chained = false;
+    this.seed = (Date.now() ^ 0x9e3779b9) >>> 0 || 1;
+    // 每層遞迴各自的盤面緩衝區與 Q 值緩衝區
+    this.bufs = Array.from({ length: MAX_STEPS + 2 }, () => new Uint8Array(CELLS));
+    this.qs = Array.from({ length: MAX_STEPS + 2 }, () => new Float64Array(MAX_STEPS + 2));
+    this.shiftBufs = Array.from({ length: MAX_STEPS + 2 }, () => new Uint8Array(CELLS));
+    this.scoreBuf = new Float32Array(CELLS);
+    this.tmpBoard = new Uint8Array(CELLS);
   }
 
-  /**
-   * 將盤面編碼為緊湊字串作為 Transposition Table Key
-   */
-  encodeBoard(board) {
-    let key = '';
-    for (let i = 0; i < CELLS; i++) {
-      key += board[i];
-    }
-    return key;
+  rand() {
+    let x = this.seed;
+    x ^= x << 13; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5; x >>>= 0;
+    this.seed = x;
+    return x;
   }
 
-  /**
-   * 重力下落（In-place 原地修改，零記憶體分配）
-   */
+  randColor() {
+    return (this.rand() % this.numColors) + 1;
+  }
+
+  // 盤面 → 置換表鍵（每格 3 bits，分兩段數值，避免逐字串接）
+  key(board, k) {
+    let a = 0, b = 0;
+    for (let i = 0; i < 13; i++) a = a * 8 + board[i];
+    for (let i = 13; i < CELLS; i++) b = b * 8 + board[i];
+    return a + ':' + b + ':' + k;
+  }
+
   applyGravity(board) {
     for (let c = 0; c < SIZE; c++) {
-      let writeRow = SIZE - 1;
-      for (let r = SIZE - 1; r >= 0; r--) {
-        const val = board[r * 5 + c];
-        if (val !== 0) {
-          board[writeRow * 5 + c] = val;
-          if (writeRow !== r) board[r * 5 + c] = 0;
-          writeRow--;
+      let w = 20 + c;
+      for (let i = 20 + c; i >= 0; i -= 5) {
+        const v = board[i];
+        if (v !== 0) {
+          if (w !== i) { board[w] = v; board[i] = 0; }
+          w -= 5;
         }
       }
-      while (writeRow >= 0) {
-        board[writeRow * 5 + c] = 0;
-        writeRow--;
-      }
     }
   }
 
-  /**
-   * 執行一次三消判定並清除，回傳本次消除張數
-   * @param {Uint8Array} board 當前盤面
-   * @param {Uint8Array|null} isNewMask 標記哪些格子是本輪新補入的（1=新補入, 0=原本留存）
-   */
-  resolveMatchesOnce(board, isNewMask) {
-    this.clearFlags.fill(0);
-    let matchedAny = false;
-
-    for (let i = 0; i < LINES_3.length; i++) {
-      const [a, b, c] = LINES_3[i];
-      const color = board[a];
-      if (color !== 0 && color === board[b] && color === board[c]) {
-        // 保守估計規則：若啟用 isNewMask，至少要有一張是原本留在盤面上的卡片
-        if (isNewMask && isNewMask[a] && isNewMask[b] && isNewMask[c]) {
-          continue;
-        }
-        this.clearFlags[a] = 1;
-        this.clearFlags[b] = 1;
-        this.clearFlags[c] = 1;
-        matchedAny = true;
+  /** 找出所有三消並清除，回傳消除張數（保守規則：三張全為新補入者不算） */
+  resolveOnce(board) {
+    const flags = this.clearFlags, isNew = this.isNew;
+    let any = false;
+    for (let i = 0; i < NLINES; i++) {
+      const a = LA[i], b = LB[i], c = LC[i];
+      const col = board[a];
+      if (col !== 0 && col === board[b] && col === board[c]) {
+        if (isNew[a] && isNew[b] && isNew[c]) continue;
+        if (!any) { flags.fill(0); any = true; }
+        flags[a] = 1; flags[b] = 1; flags[c] = 1;
       }
     }
-
-    if (!matchedAny) return 0;
-
-    let clearedCount = 0;
+    if (!any) return 0;
+    let n = 0;
     for (let i = 0; i < CELLS; i++) {
-      if (this.clearFlags[i]) {
-        board[i] = 0;
-        if (isNewMask) isNewMask[i] = 0;
-        clearedCount++;
-      }
+      if (flags[i]) { board[i] = 0; n++; }
     }
-    return clearedCount;
+    return n;
   }
 
   /**
-   * 隨機填滿空位，並回傳新填補位置的遮罩
+   * 模擬點擊 idx、首張補牌為 color 的完整連鎖。結果寫入 dst，回傳總消除張數。
+   * this.chained 表示是否發生連鎖（發生則結果含隨機性）。
    */
-  fillEmptyRandom(board, isNewMask) {
-    isNewMask.fill(0);
-    for (let i = 0; i < CELLS; i++) {
-      if (board[i] === 0) {
-        board[i] = ((Math.random() * this.numColors) | 0) + 1;
-        isNewMask[i] = 1;
-      }
-    }
-  }
+  simulate(src, idx, color, dst) {
+    dst.set(src);
+    const c = idx % 5;
+    // 單格消除：上方同欄整段下移一格，頂端補入 color
+    for (let i = idx; i >= 5; i -= 5) dst[i] = dst[i - 5];
+    dst[c] = color;
+    const isNew = this.isNew;
+    isNew.fill(0);
+    isNew[c] = 1;
 
-  /**
-   * 模擬點擊某格後的完整連鎖過程（單次模擬）
-   * 回傳：{ totalCleared, nextBoard }
-   */
-  simulateClickOnce(srcBoard, clickIdx, forcedFirstColor = 0) {
-    const board = new Uint8Array(srcBoard);
-    const isNewMask = new Uint8Array(CELLS);
-
-    // 1. 點擊消除該格
-    board[clickIdx] = 0;
-    let totalCleared = 1;
-
-    // 2. 下落並補入第一張牌（此時空位必為 1 格）
-    this.applyGravity(board);
-    isNewMask.fill(0);
-    for (let i = 0; i < CELLS; i++) {
-      if (board[i] === 0) {
-        board[i] = forcedFirstColor || (((Math.random() * this.numColors) | 0) + 1);
-        isNewMask[i] = 1;
-        break;
-      }
-    }
-
-    // 3. 連鎖循環直到沒有三消
+    let total = 1;
+    this.chained = false;
     while (true) {
-      const cleared = this.resolveMatchesOnce(board, isNewMask);
-      if (cleared === 0) break;
-      totalCleared += cleared;
-      this.applyGravity(board);
-      this.fillEmptyRandom(board, isNewMask);
+      const n = this.resolveOnce(dst);
+      if (n === 0) break;
+      this.chained = true;
+      total += n;
+      this.applyGravity(dst);
+      isNew.fill(0);
+      for (let i = 0; i < CELLS; i++) {
+        if (dst[i] === 0) { dst[i] = this.randColor(); isNew[i] = 1; }
+      }
     }
-
-    return { totalCleared, nextBoard: board };
+    return total;
   }
 
-  /**
-   * 啟發式快速評分：用來在深層搜尋時篩選出 Top-K 潛力點擊位置
-   */
-  rankCandidateMoves(board, topK) {
-    if (topK >= CELLS) {
-      return Array.from({ length: CELLS }, (_, i) => i);
-    }
-
-    const scores = new Float32Array(CELLS);
-    const tempBoard = new Uint8Array(CELLS);
-
+  /** 啟發式排序：點擊後（下落後）盤面的三連 / 二連潛力 */
+  rankMoves(board, topK) {
+    if (topK >= CELLS) return ALL_MOVES;
+    const scores = this.scoreBuf, t = this.tmpBoard;
     for (let idx = 0; idx < CELLS; idx++) {
-      tempBoard.set(board);
-      tempBoard[idx] = 0;
-      this.applyGravity(tempBoard);
-
-      // 評估下落後盤面上形成「二連」或「三連」的潛力
-      let potential = 0;
-      for (let i = 0; i < LINES_3.length; i++) {
-        const [a, b, c] = LINES_3[i];
-        const ca = tempBoard[a], cb = tempBoard[b], cc = tempBoard[c];
-        if (ca !== 0 && ca === cb && cb === cc) potential += 10; // 直接三消
-        else if ((ca !== 0 && ca === cb) || (cb !== 0 && cb === cc) || (ca !== 0 && ca === cc)) {
-          potential += 2; // 聽牌二連
-        }
+      t.set(board);
+      for (let i = idx; i >= 5; i -= 5) t[i] = t[i - 5];
+      t[idx % 5] = 0;
+      let p = 0;
+      for (let i = 0; i < NLINES; i++) {
+        const ca = t[LA[i]], cb = t[LB[i]], cc = t[LC[i]];
+        if (ca !== 0 && ca === cb && cb === cc) p += 10;
+        else if ((ca !== 0 && ca === cb) || (cb !== 0 && cb === cc) || (ca !== 0 && ca === cc)) p += 2;
       }
-      scores[idx] = potential;
+      scores[idx] = p;
     }
-
-    const indices = Array.from({ length: CELLS }, (_, i) => i);
-    indices.sort((a, b) => scores[b] - scores[a]);
-    return indices.slice(0, topK);
+    const idxs = ALL_MOVES.slice();
+    idxs.sort((a, b) => scores[b] - scores[a]);
+    return idxs.slice(0, topK);
   }
 
   /**
-   * Expectimax 核心遞迴：計算在 board 狀態下，再走 remainingSteps 步的最大期望總消除數
+   * 對「點擊 idx」這個動作，計算 Q 向量：q[k] = 點擊後再最佳走 k-1 步的期望總消除數（k = 1..K）
+   * 結果累加進 q（呼叫前需清零）。
    */
-  expectimax(board, remainingSteps, maxDepth) {
-    if (remainingSteps === 0) return 0;
+  actionQ(board, idx, K, q, buf, chainSamples, level, hasLatent) {
+    const nc = this.numColors;
+    const c = idx % 5;
+    // 快速路徑：先做一次「欄位下移」，各顏色只需檢查受影響的線即可判斷是否連鎖
+    const base = this.shiftBufs[level];
+    base.set(board);
+    for (let i = idx; i >= 5; i -= 5) base[i] = base[i - 5];
+    const aff = AFFECTED[idx];
 
-    const memoKey = `${this.encodeBoard(board)}_${remainingSteps}`;
-    const cached = this.memo.get(memoKey);
-    if (cached !== undefined) return cached;
-
-    // 依深度動態調整取樣數與剪枝寬度（兼顧速度與準確度）
-    const depthIndex = maxDepth - remainingSteps; // 0 = 第一步, 1 = 第二步...
-    const topK = depthIndex === 0 ? 25 : depthIndex === 1 ? 12 : 7;
-    const mcSamples = remainingSteps === 1 ? 16 : remainingSteps === 2 ? 8 : 4;
-
-    const candidates = this.rankCandidateMoves(board, topK);
-    let bestExpected = 0;
-
-    for (let m = 0; m < candidates.length; m++) {
-      const clickIdx = candidates[m];
-      let moveExpected = 0;
-
-      // 第一步補牌精確枚舉所有顏色 (1 ~ numColors)
-      for (let color = 1; color <= this.numColors; color++) {
-        if (remainingSteps === 1) {
-          // 葉節點：只需做輕量取樣計算期望消除張數
-          let subTotal = 0;
-          for (let s = 0; s < mcSamples; s++) {
-            subTotal += this.simulateClickOnce(board, clickIdx, color).totalCleared;
-          }
-          moveExpected += subTotal / mcSamples;
-        } else {
-          // 非葉節點：模擬連鎖後遞迴進入下一步
-          let branchTotal = 0;
-          const branchSamples = Math.max(2, Math.floor(mcSamples / 2));
-          for (let s = 0; s < branchSamples; s++) {
-            const { totalCleared, nextBoard } = this.simulateClickOnce(board, clickIdx, color);
-            branchTotal += totalCleared + this.expectimax(nextBoard, remainingSteps - 1, maxDepth);
-          }
-          moveExpected += branchTotal / branchSamples;
+    for (let color = 1; color <= nc; color++) {
+      let match = hasLatent;
+      if (!match) {
+        base[c] = color;
+        for (let j = 0; j < aff.length; j++) {
+          const l = aff[j];
+          const x = base[LA[l]];
+          if (x === base[LB[l]] && x === base[LC[l]]) { match = true; break; }
         }
       }
-
-      moveExpected /= this.numColors;
-      if (moveExpected > bestExpected) {
-        bestExpected = moveExpected;
+      if (!match) {
+        // 無連鎖：結果確定，只算一次
+        if (K > 1) {
+          const child = this.values(base, K - 1);
+          for (let k = 1; k <= K; k++) q[k] += (1 + child[k - 1]) / nc;
+        } else {
+          q[1] += 1 / nc;
+        }
+        continue;
+      }
+      // 有連鎖：之後補牌隨機，取樣平均
+      const w = 1 / (nc * chainSamples);
+      for (let s = 0; s < chainSamples; s++) {
+        const r = this.simulate(board, idx, color, buf);
+        if (K > 1) {
+          const child = this.values(buf, K - 1);
+          for (let k = 1; k <= K; k++) q[k] += (r + child[k - 1]) * w;
+        } else {
+          q[1] += r * w;
+        }
       }
     }
+  }
 
-    this.memo.set(memoKey, bestExpected);
-    return bestExpected;
+  /** 盤面是否殘留「全為新補入、被保守規則略過」的三連（下一次點擊時會被消除） */
+  hasLatentTriple(board) {
+    for (let i = 0; i < NLINES; i++) {
+      const x = board[LA[i]];
+      if (x === board[LB[i]] && x === board[LC[i]]) return true;
+    }
+    return false;
   }
 
   /**
-   * 針對指定的起手點列表計算 1 ~ maxSteps 的最佳「期望消除數 / 步數」
+   * 回傳向量 v，v[k] = 從 board 出發最佳走 k 步的期望總消除數（k = 0..K）
+   */
+  values(board, K) {
+    // 葉節點（剩 1 步）不進置換表：重算很便宜，存起來反而佔掉大量記憶體
+    const useMemo = K >= 2;
+    let mk = '';
+    if (useMemo) {
+      mk = this.key(board, K);
+      const cached = this.memo.get(mk);
+      if (cached !== undefined) return cached;
+    }
+
+    const v = new Float64Array(K + 1);
+    const q = this.qs[K];
+    const buf = this.bufs[K];
+    const cands = this.rankMoves(board, TOPK_BY_REMAINING[K]);
+    const samples = CHAIN_SAMPLES_BY_REMAINING[K];
+    const latent = this.hasLatentTriple(board);
+
+    for (let m = 0; m < cands.length; m++) {
+      q.fill(0);
+      this.actionQ(board, cands[m], K, q, buf, samples, K, latent);
+      for (let k = 1; k <= K; k++) if (q[k] > v[k]) v[k] = q[k];
+    }
+    if (useMemo) this.memo.set(mk, v);
+    return v;
+  }
+
+  /**
+   * 針對指定起手點列表，計算 1 ~ maxSteps 中「期望消除 / 步數」最佳者
    */
   evaluateStartMoves(boardArray, startIndices, maxSteps) {
+    maxSteps = Math.min(maxSteps, MAX_STEPS);
     const board = new Uint8Array(boardArray);
+    // 換了盤面或步數才清空置換表（同一次計算的多個起手點可共用），避免越積越大
+    const sig = this.key(board, maxSteps);
+    if (sig !== this.lastSig) { this.memo.clear(); this.lastSig = sig; }
     const results = [];
+    const q = this.qs[MAX_STEPS + 1];
+    const buf = this.bufs[MAX_STEPS + 1];
 
-    // 每次重新計算時清理過大的快取避免記憶體膨脹
-    if (this.memo.size > 150000) this.memo.clear();
-
+    const latent = this.hasLatentTriple(board);
     for (const startIdx of startIndices) {
-      let bestRatio = 0;
-      let bestStep = 1;
-      let bestTotal = 0;
-
-      // 評估規劃 1 ~ maxSteps 步，取「期望/步數」最大值（涵蓋先佈局後爆發策略）
-      for (let steps = 1; steps <= maxSteps; steps++) {
-        let stepExpected = 0;
-        const outerSamples = steps >= 3 ? 6 : 16;
-
-        for (let color = 1; color <= this.numColors; color++) {
-          let colorSum = 0;
-          for (let s = 0; s < outerSamples; s++) {
-            const { totalCleared, nextBoard } = this.simulateClickOnce(board, startIdx, color);
-            const future = steps > 1 ? this.expectimax(nextBoard, steps - 1, steps) : 0;
-            colorSum += totalCleared + future;
-          }
-          stepExpected += colorSum / outerSamples;
-        }
-
-        stepExpected /= this.numColors;
-        const ratio = stepExpected / steps;
-
-        if (ratio > bestRatio) {
-          bestRatio = ratio;
-          bestStep = steps;
-          bestTotal = stepExpected;
-        }
+      q.fill(0);
+      this.actionQ(board, startIdx, maxSteps, q, buf, ROOT_CHAIN_SAMPLES, MAX_STEPS + 1, latent);
+      let bestRatio = 0, bestStep = 1, bestTotal = 0;
+      for (let k = 1; k <= maxSteps; k++) {
+        const ratio = q[k] / k;
+        if (ratio > bestRatio) { bestRatio = ratio; bestStep = k; bestTotal = q[k]; }
       }
-
       results.push({
         index: startIdx,
         row: Math.floor(startIdx / 5) + 1,
@@ -284,7 +286,6 @@ export class ChainSolver {
         expectedTotal: bestTotal
       });
     }
-
     return results;
   }
 }
