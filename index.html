@@ -238,16 +238,17 @@
 
       const t0 = performance.now();
 
-      // 動態工作佇列：每個 Worker 一次領一個起手點，算完再領下一個（避免有的核心閒置、有的塞車）
+      // 動態工作佇列：每個 Worker 一次領一個起手點，算完再領下一個，並按 index 歸位避免不穩定排序
       const queue = Array.from({ length: 25 }, (_, i) => i);
-      const allResultsRaw = [];
+      const allResultsRaw = new Array(25);
       let done = 0;
       await Promise.all(workers.map(worker => new Promise(resolve => {
         const next = () => {
           if (queue.length === 0) { worker.onmessage = null; resolve(); return; }
           const idx = queue.shift();
           worker.onmessage = (e) => {
-            allResultsRaw.push(...e.data.results);
+            const res = e.data.results[0];
+            allResultsRaw[res.index] = res;
             done++;
             statusEl.textContent = `正在使用 ${workerCount} 執行緒運算 ${maxSteps} 步規劃⋯⋯ ${done}/25`;
             next();
@@ -257,7 +258,16 @@
         next();
       })));
 
-      const allResults = allResultsRaw.sort((a, b) => b.scorePerStep - a.scorePerStep);
+      // 嚴格的確定性排序（含 Tie-breaker：分數平手時比總消除數，再平手比 index）
+      const allResults = allResultsRaw.sort((a, b) => {
+        const scoreDiff = b.scorePerStep - a.scorePerStep;
+        if (Math.abs(scoreDiff) > 1e-4) return scoreDiff;
+
+        const totalDiff = b.expectedTotal - a.expectedTotal;
+        if (Math.abs(totalDiff) > 1e-4) return totalDiff;
+
+        return a.index - b.index;
+      });
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
       // 更新前三名徽章
